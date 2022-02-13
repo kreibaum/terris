@@ -7,13 +7,19 @@ use crate::{
 };
 
 use actix::{
-    Actor, ActorContext, AsyncContext, Context, Handler, Message, StreamHandler, Supervised,
+    Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message, StreamHandler, Supervised,
     SystemService,
 };
-use actix_web::{web, Error, HttpRequest, HttpResponse};
+use actix_web::{
+    web::{self, Data},
+    Error, HttpRequest, HttpResponse,
+};
 use actix_web_actors::ws;
 use log::{debug, info};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 /// How often heartbeat pings are sent
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -76,12 +82,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebsocketActor {
 /// Sets up a websocket connection ensuring there is a uuid.
 pub async fn websocket_handler(
     req: HttpRequest,
+    table: Data<RoutingDefinitionTable>,
     stream: web::Payload,
 ) -> Result<HttpResponse, Error> {
     debug!("Websocket connection!");
     if let Some(uuid) = UserUuid::from_query_string(req.query_string()) {
         let router = DynamicRouteService::from_registry();
-        let m = GetActorForRoute("/".to_owned());
+        let table_clone: &RoutingDefinitionTable = &table;
+        let m = GetActorForRoute("/".to_owned(), table_clone.clone());
         debug!("{uuid}");
         let addr = router.send(m).await.map_err(|_| {
             actix_web::error::ErrorInternalServerError(
@@ -109,8 +117,18 @@ pub async fn websocket_handler(
     ))
 }
 
+struct SharedLiveStateActor {
+    live_state: Box<dyn SharedLiveState>,
+}
+
+impl Actor for SharedLiveStateActor {
+    type Context = Context<Self>;
+}
+
 #[derive(Default)]
-struct DynamicRouteService;
+struct DynamicRouteService {
+    alive_routes: HashMap<String, BoxAddr>,
+}
 
 impl Supervised for DynamicRouteService {}
 
@@ -120,7 +138,7 @@ impl Actor for DynamicRouteService {
     type Context = Context<Self>;
 }
 
-struct GetActorForRoute(String);
+struct GetActorForRoute(String, RoutingDefinitionTable);
 
 impl Message for GetActorForRoute {
     type Result = Option<BoxAddr>;
@@ -131,16 +149,63 @@ impl Handler<GetActorForRoute> for DynamicRouteService {
     type Result = Option<BoxAddr>;
 
     fn handle(&mut self, msg: GetActorForRoute, _: &mut Context<Self>) -> Self::Result {
-        Some(BoxAddr(Box::new(DummyActor)))
+        // First check if the route is already alive.
+        if let Some(x) = self.alive_routes.get(&msg.0) {
+            return Some(x.clone());
+        }
+
+        for route in msg.1.routes {
+            if let Some(x) = route.handle(&msg.0) {
+                debug!("Creating Actor for route: {}", msg.0);
+                let actor = SharedLiveStateActor { live_state: x };
+                let addr = actor.start();
+                let b = BoxAddr(Box::new(addr));
+                self.alive_routes.insert(msg.0.clone(), b.clone());
+                return Some(b);
+            }
+        }
+
+        None
     }
 }
 
-/// Dummy route
-#[derive(Debug)]
-struct DummyActor;
-
-impl TraitAddr for DummyActor {
+impl TraitAddr for actix::Addr<SharedLiveStateActor> {
     fn send(&self, msg: crate::messages::BoxMsg) {
         todo!()
     }
+
+    fn clone_box(&self) -> Box<dyn TraitAddr> {
+        Box::new(self.clone())
+    }
 }
+
+#[derive(Clone, Default)]
+pub struct RoutingDefinitionTable {
+    pub routes: Vec<Box<dyn RoutingEntry + Send>>,
+    // pub routes: Vec<Box<dyn Fn(&str) -> Option<Box<dyn SharedLiveState>> + Send>>,
+}
+
+pub trait RoutingEntry {
+    /// Return `None` if the route string is not handled.
+    /// Otherwise return a Live State object.
+    fn handle(&self, path: &str) -> Option<Box<dyn SharedLiveState>>;
+    /// Workaround for object safety.
+    fn clone_box(&self) -> Box<dyn RoutingEntry + Send>;
+}
+
+impl Clone for Box<dyn RoutingEntry + Send> {
+    // https://stackoverflow.com/questions/30353462/how-to-clone-a-struct-storing-a-boxed-trait-object
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+impl RoutingDefinitionTable {
+    /// Adds a route handler to the routing table.
+    pub fn with_entry(mut self, routing_entry: Box<dyn RoutingEntry + Send>) -> Self {
+        self.routes.push(routing_entry);
+        self
+    }
+}
+
+pub trait SharedLiveState {}

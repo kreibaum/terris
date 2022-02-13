@@ -21,24 +21,56 @@ extern crate simplelog;
 mod models;
 mod schema;
 
+use std::sync::Arc;
+
 use actix_web::{web, App, HttpServer};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use log::debug;
-use terris::websocket_actor::websocket_handler;
+use terris::websocket_actor::{
+    websocket_handler, RoutingDefinitionTable, RoutingEntry, SharedLiveState,
+};
+
+struct ShoeGame {
+    count: i32,
+}
+
+#[derive(Clone)]
+struct ShoeGameRoutingEntry();
+impl RoutingEntry for ShoeGameRoutingEntry {
+    fn handle(&self, path: &str) -> Option<Box<dyn SharedLiveState>> {
+        Some(Box::new(ShoeGame { count: 0 }))
+    }
+
+    fn clone_box(&self) -> Box<dyn RoutingEntry + Send> {
+        Box::new(self.clone())
+    }
+}
+
+impl SharedLiveState for ShoeGame {}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     init_logger();
     let results = load_all_questions();
 
+    // let routes = vec![Box::new(|_: &str| Some(Box::new(ShoeGame { count: 0 })))];
+    // routing.add(|_: &str| Some(Box::new(ShoeGame { count: 0 })));
+
     // Instead of routing, I want this server to have a single state that is
     // shared by all connections.
+    // let wrap = RoutingTableWrapper(Arc::new(routing));
 
-    HttpServer::new(|| App::new().route("/ws", web::get().to(websocket_handler)))
-        .bind("127.0.0.1:8080")?
-        .run()
-        .await
+    HttpServer::new(move || {
+        let routing =
+            RoutingDefinitionTable::default().with_entry(Box::new(ShoeGameRoutingEntry()));
+        App::new()
+            .data(routing)
+            .route("/ws", web::get().to(websocket_handler))
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
 }
 
 fn load_all_questions() -> Vec<models::Question> {
